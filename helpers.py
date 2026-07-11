@@ -1,641 +1,1100 @@
-from __future__ import annotations
-
-import importlib.util
-import os
+# helpers.py
+import html.entities
+import re
 import sys
-import typing as t
-from datetime import datetime
-from functools import cache
-from functools import update_wrapper
+import typing
 
-import werkzeug.utils
-from werkzeug.exceptions import abort as _wz_abort
-from werkzeug.utils import redirect as _wz_redirect
-from werkzeug.wrappers import Response as BaseResponse
-
-from .globals import _cv_app
-from .globals import _cv_request
-from .globals import current_app
-from .globals import request
-from .globals import request_ctx
-from .globals import session
-from .signals import message_flashed
-
-if t.TYPE_CHECKING:  # pragma: no cover
-    from .wrappers import Response
+from . import __diag__
+from .core import *
+from .util import (
+    _bslash,
+    _flatten,
+    _escape_regex_range_chars,
+    replaced_by_pep8,
+)
 
 
-def get_debug_flag() -> bool:
-    """Get whether debug mode should be enabled for the app, indicated by the
-    :envvar:`FLASK_DEBUG` environment variable. The default is ``False``.
+#
+# global helpers
+#
+def counted_array(
+    expr: ParserElement,
+    int_expr: typing.Optional[ParserElement] = None,
+    *,
+    intExpr: typing.Optional[ParserElement] = None,
+) -> ParserElement:
+    """Helper to define a counted list of expressions.
+
+    This helper defines a pattern of the form::
+
+        integer expr expr expr...
+
+    where the leading integer tells how many expr expressions follow.
+    The matched tokens returns the array of expr tokens as a list - the
+    leading count token is suppressed.
+
+    If ``int_expr`` is specified, it should be a pyparsing expression
+    that produces an integer value.
+
+    Example::
+
+        counted_array(Word(alphas)).parse_string('2 ab cd ef')  # -> ['ab', 'cd']
+
+        # in this parser, the leading integer value is given in binary,
+        # '10' indicating that 2 values are in the array
+        binary_constant = Word('01').set_parse_action(lambda t: int(t[0], 2))
+        counted_array(Word(alphas), int_expr=binary_constant).parse_string('10 ab cd ef')  # -> ['ab', 'cd']
+
+        # if other fields must be parsed after the count but before the
+        # list items, give the fields results names and they will
+        # be preserved in the returned ParseResults:
+        count_with_metadata = integer + Word(alphas)("type")
+        typed_array = counted_array(Word(alphanums), int_expr=count_with_metadata)("items")
+        result = typed_array.parse_string("3 bool True True False")
+        print(result.dump())
+
+        # prints
+        # ['True', 'True', 'False']
+        # - items: ['True', 'True', 'False']
+        # - type: 'bool'
     """
-    val = os.environ.get("FLASK_DEBUG")
-    return bool(val and val.lower() not in {"0", "false", "no"})
+    intExpr = intExpr or int_expr
+    array_expr = Forward()
+
+    def count_field_parse_action(s, l, t):
+        nonlocal array_expr
+        n = t[0]
+        array_expr <<= (expr * n) if n else Empty()
+        # clear list contents, but keep any named results
+        del t[:]
+
+    if intExpr is None:
+        intExpr = Word(nums).set_parse_action(lambda t: int(t[0]))
+    else:
+        intExpr = intExpr.copy()
+    intExpr.set_name("arrayLen")
+    intExpr.add_parse_action(count_field_parse_action, call_during_try=True)
+    return (intExpr + array_expr).set_name("(len) " + str(expr) + "...")
 
 
-def get_load_dotenv(default: bool = True) -> bool:
-    """Get whether the user has disabled loading default dotenv files by
-    setting :envvar:`FLASK_SKIP_DOTENV`. The default is ``True``, load
-    the files.
+def match_previous_literal(expr: ParserElement) -> ParserElement:
+    """Helper to define an expression that is indirectly defined from
+    the tokens matched in a previous expression, that is, it looks for
+    a 'repeat' of a previous expression.  For example::
 
-    :param default: What to return if the env var isn't set.
+        first = Word(nums)
+        second = match_previous_literal(first)
+        match_expr = first + ":" + second
+
+    will match ``"1:1"``, but not ``"1:2"``.  Because this
+    matches a previous literal, will also match the leading
+    ``"1:1"`` in ``"1:10"``. If this is not desired, use
+    :class:`match_previous_expr`. Do *not* use with packrat parsing
+    enabled.
     """
-    val = os.environ.get("FLASK_SKIP_DOTENV")
+    rep = Forward()
 
-    if not val:
-        return default
+    def copy_token_to_repeater(s, l, t):
+        if t:
+            if len(t) == 1:
+                rep << t[0]
+            else:
+                # flatten t tokens
+                tflat = _flatten(t.as_list())
+                rep << And(Literal(tt) for tt in tflat)
+        else:
+            rep << Empty()
 
-    return val.lower() in ("0", "false", "no")
-
-
-@t.overload
-def stream_with_context(
-    generator_or_function: t.Iterator[t.AnyStr],
-) -> t.Iterator[t.AnyStr]: ...
-
-
-@t.overload
-def stream_with_context(
-    generator_or_function: t.Callable[..., t.Iterator[t.AnyStr]],
-) -> t.Callable[[t.Iterator[t.AnyStr]], t.Iterator[t.AnyStr]]: ...
+    expr.add_parse_action(copy_token_to_repeater, callDuringTry=True)
+    rep.set_name("(prev) " + str(expr))
+    return rep
 
 
-def stream_with_context(
-    generator_or_function: t.Iterator[t.AnyStr] | t.Callable[..., t.Iterator[t.AnyStr]],
-) -> t.Iterator[t.AnyStr] | t.Callable[[t.Iterator[t.AnyStr]], t.Iterator[t.AnyStr]]:
-    """Wrap a response generator function so that it runs inside the current
-    request context. This keeps :data:`request`, :data:`session`, and :data:`g`
-    available, even though at the point the generator runs the request context
-    will typically have ended.
+def match_previous_expr(expr: ParserElement) -> ParserElement:
+    """Helper to define an expression that is indirectly defined from
+    the tokens matched in a previous expression, that is, it looks for
+    a 'repeat' of a previous expression.  For example::
 
-    Use it as a decorator on a generator function:
+        first = Word(nums)
+        second = match_previous_expr(first)
+        match_expr = first + ":" + second
 
-    .. code-block:: python
-
-        from flask import stream_with_context, request, Response
-
-        @app.get("/stream")
-        def streamed_response():
-            @stream_with_context
-            def generate():
-                yield "Hello "
-                yield request.args["name"]
-                yield "!"
-
-            return Response(generate())
-
-    Or use it as a wrapper around a created generator:
-
-    .. code-block:: python
-
-        from flask import stream_with_context, request, Response
-
-        @app.get("/stream")
-        def streamed_response():
-            def generate():
-                yield "Hello "
-                yield request.args["name"]
-                yield "!"
-
-            return Response(stream_with_context(generate()))
-
-    .. versionadded:: 0.9
+    will match ``"1:1"``, but not ``"1:2"``.  Because this
+    matches by expressions, will *not* match the leading ``"1:1"``
+    in ``"1:10"``; the expressions are evaluated first, and then
+    compared, so ``"1"`` is compared with ``"10"``. Do *not* use
+    with packrat parsing enabled.
     """
-    try:
-        gen = iter(generator_or_function)  # type: ignore[arg-type]
-    except TypeError:
+    rep = Forward()
+    e2 = expr.copy()
+    rep <<= e2
 
-        def decorator(*args: t.Any, **kwargs: t.Any) -> t.Any:
-            gen = generator_or_function(*args, **kwargs)  # type: ignore[operator]
-            return stream_with_context(gen)
+    def copy_token_to_repeater(s, l, t):
+        matchTokens = _flatten(t.as_list())
 
-        return update_wrapper(decorator, generator_or_function)  # type: ignore[arg-type]
+        def must_match_these_tokens(s, l, t):
+            theseTokens = _flatten(t.as_list())
+            if theseTokens != matchTokens:
+                raise ParseException(
+                    s, l, f"Expected {matchTokens}, found{theseTokens}"
+                )
 
-    def generator() -> t.Iterator[t.AnyStr]:
-        if (req_ctx := _cv_request.get(None)) is None:
-            raise RuntimeError(
-                "'stream_with_context' can only be used when a request"
-                " context is active, such as in a view function."
+        rep.set_parse_action(must_match_these_tokens, callDuringTry=True)
+
+    expr.add_parse_action(copy_token_to_repeater, callDuringTry=True)
+    rep.set_name("(prev) " + str(expr))
+    return rep
+
+
+def one_of(
+    strs: Union[typing.Iterable[str], str],
+    caseless: bool = False,
+    use_regex: bool = True,
+    as_keyword: bool = False,
+    *,
+    useRegex: bool = True,
+    asKeyword: bool = False,
+) -> ParserElement:
+    """Helper to quickly define a set of alternative :class:`Literal` s,
+    and makes sure to do longest-first testing when there is a conflict,
+    regardless of the input order, but returns
+    a :class:`MatchFirst` for best performance.
+
+    Parameters:
+
+    - ``strs`` - a string of space-delimited literals, or a collection of
+      string literals
+    - ``caseless`` - treat all literals as caseless - (default= ``False``)
+    - ``use_regex`` - as an optimization, will
+      generate a :class:`Regex` object; otherwise, will generate
+      a :class:`MatchFirst` object (if ``caseless=True`` or ``as_keyword=True``, or if
+      creating a :class:`Regex` raises an exception) - (default= ``True``)
+    - ``as_keyword`` - enforce :class:`Keyword`-style matching on the
+      generated expressions - (default= ``False``)
+    - ``asKeyword`` and ``useRegex`` are retained for pre-PEP8 compatibility,
+      but will be removed in a future release
+
+    Example::
+
+        comp_oper = one_of("< = > <= >= !=")
+        var = Word(alphas)
+        number = Word(nums)
+        term = var | number
+        comparison_expr = term + comp_oper + term
+        print(comparison_expr.search_string("B = 12  AA=23 B<=AA AA>12"))
+
+    prints::
+
+        [['B', '=', '12'], ['AA', '=', '23'], ['B', '<=', 'AA'], ['AA', '>', '12']]
+    """
+    asKeyword = asKeyword or as_keyword
+    useRegex = useRegex and use_regex
+
+    if (
+        isinstance(caseless, str_type)
+        and __diag__.warn_on_multiple_string_args_to_oneof
+    ):
+        warnings.warn(
+            "More than one string argument passed to one_of, pass"
+            " choices as a list or space-delimited string",
+            stacklevel=2,
+        )
+
+    if caseless:
+        isequal = lambda a, b: a.upper() == b.upper()
+        masks = lambda a, b: b.upper().startswith(a.upper())
+        parseElementClass = CaselessKeyword if asKeyword else CaselessLiteral
+    else:
+        isequal = lambda a, b: a == b
+        masks = lambda a, b: b.startswith(a)
+        parseElementClass = Keyword if asKeyword else Literal
+
+    symbols: List[str] = []
+    if isinstance(strs, str_type):
+        strs = typing.cast(str, strs)
+        symbols = strs.split()
+    elif isinstance(strs, Iterable):
+        symbols = list(strs)
+    else:
+        raise TypeError("Invalid argument to one_of, expected string or iterable")
+    if not symbols:
+        return NoMatch()
+
+    # reorder given symbols to take care to avoid masking longer choices with shorter ones
+    # (but only if the given symbols are not just single characters)
+    if any(len(sym) > 1 for sym in symbols):
+        i = 0
+        while i < len(symbols) - 1:
+            cur = symbols[i]
+            for j, other in enumerate(symbols[i + 1 :]):
+                if isequal(other, cur):
+                    del symbols[i + j + 1]
+                    break
+                elif masks(cur, other):
+                    del symbols[i + j + 1]
+                    symbols.insert(i, other)
+                    break
+            else:
+                i += 1
+
+    if useRegex:
+        re_flags: int = re.IGNORECASE if caseless else 0
+
+        try:
+            if all(len(sym) == 1 for sym in symbols):
+                # symbols are just single characters, create range regex pattern
+                patt = f"[{''.join(_escape_regex_range_chars(sym) for sym in symbols)}]"
+            else:
+                patt = "|".join(re.escape(sym) for sym in symbols)
+
+            # wrap with \b word break markers if defining as keywords
+            if asKeyword:
+                patt = rf"\b(?:{patt})\b"
+
+            ret = Regex(patt, flags=re_flags).set_name(" | ".join(symbols))
+
+            if caseless:
+                # add parse action to return symbols as specified, not in random
+                # casing as found in input string
+                symbol_map = {sym.lower(): sym for sym in symbols}
+                ret.add_parse_action(lambda s, l, t: symbol_map[t[0].lower()])
+
+            return ret
+
+        except re.error:
+            warnings.warn(
+                "Exception creating Regex for one_of, building MatchFirst", stacklevel=2
             )
 
-        app_ctx = _cv_app.get()
-        # Setup code below will run the generator to this point, so that the
-        # current contexts are recorded. The contexts must be pushed after,
-        # otherwise their ContextVar will record the wrong event loop during
-        # async view functions.
-        yield None  # type: ignore[misc]
-
-        # Push the app context first, so that the request context does not
-        # automatically create and push a different app context.
-        with app_ctx, req_ctx:
-            try:
-                yield from gen
-            finally:
-                # Clean up in case the user wrapped a WSGI iterator.
-                if hasattr(gen, "close"):
-                    gen.close()
-
-    # Execute the generator to the sentinel value. This ensures the context is
-    # preserved in the generator's state. Further iteration will push the
-    # context and yield from the original iterator.
-    wrapped_g = generator()
-    next(wrapped_g)
-    return wrapped_g
+    # last resort, just use MatchFirst
+    return MatchFirst(parseElementClass(sym) for sym in symbols).set_name(
+        " | ".join(symbols)
+    )
 
 
-def make_response(*args: t.Any) -> Response:
-    """Sometimes it is necessary to set additional headers in a view.  Because
-    views do not have to return response objects but can return a value that
-    is converted into a response object by Flask itself, it becomes tricky to
-    add headers to it.  This function can be called instead of using a return
-    and you will get a response object which you can use to attach headers.
+def dict_of(key: ParserElement, value: ParserElement) -> ParserElement:
+    """Helper to easily and clearly define a dictionary by specifying
+    the respective patterns for the key and value.  Takes care of
+    defining the :class:`Dict`, :class:`ZeroOrMore`, and
+    :class:`Group` tokens in the proper order.  The key pattern
+    can include delimiting markers or punctuation, as long as they are
+    suppressed, thereby leaving the significant key text.  The value
+    pattern can include named results, so that the :class:`Dict` results
+    can include named token fields.
 
-    If view looked like this and you want to add a new header::
+    Example::
 
-        def index():
-            return render_template('index.html', foo=42)
+        text = "shape: SQUARE posn: upper left color: light blue texture: burlap"
+        attr_expr = (label + Suppress(':') + OneOrMore(data_word, stop_on=label).set_parse_action(' '.join))
+        print(attr_expr[1, ...].parse_string(text).dump())
 
-    You can now do something like this::
+        attr_label = label
+        attr_value = Suppress(':') + OneOrMore(data_word, stop_on=label).set_parse_action(' '.join)
 
-        def index():
-            response = make_response(render_template('index.html', foo=42))
-            response.headers['X-Parachutes'] = 'parachutes are cool'
-            return response
+        # similar to Dict, but simpler call format
+        result = dict_of(attr_label, attr_value).parse_string(text)
+        print(result.dump())
+        print(result['shape'])
+        print(result.shape)  # object attribute access works too
+        print(result.as_dict())
 
-    This function accepts the very same arguments you can return from a
-    view function.  This for example creates a response with a 404 error
-    code::
+    prints::
 
-        response = make_response(render_template('not_found.html'), 404)
-
-    The other use case of this function is to force the return value of a
-    view function into a response which is helpful with view
-    decorators::
-
-        response = make_response(view_function())
-        response.headers['X-Parachutes'] = 'parachutes are cool'
-
-    Internally this function does the following things:
-
-    -   if no arguments are passed, it creates a new response argument
-    -   if one argument is passed, :meth:`flask.Flask.make_response`
-        is invoked with it.
-    -   if more than one argument is passed, the arguments are passed
-        to the :meth:`flask.Flask.make_response` function as tuple.
-
-    .. versionadded:: 0.6
+        [['shape', 'SQUARE'], ['posn', 'upper left'], ['color', 'light blue'], ['texture', 'burlap']]
+        - color: 'light blue'
+        - posn: 'upper left'
+        - shape: 'SQUARE'
+        - texture: 'burlap'
+        SQUARE
+        SQUARE
+        {'color': 'light blue', 'shape': 'SQUARE', 'posn': 'upper left', 'texture': 'burlap'}
     """
-    if not args:
-        return current_app.response_class()
-    if len(args) == 1:
-        args = args[0]
-    return current_app.make_response(args)
+    return Dict(OneOrMore(Group(key + value)))
 
 
-def url_for(
-    endpoint: str,
+def original_text_for(
+    expr: ParserElement, as_string: bool = True, *, asString: bool = True
+) -> ParserElement:
+    """Helper to return the original, untokenized text for a given
+    expression.  Useful to restore the parsed fields of an HTML start
+    tag into the raw tag text itself, or to revert separate tokens with
+    intervening whitespace back to the original matching input text. By
+    default, returns a string containing the original parsed text.
+
+    If the optional ``as_string`` argument is passed as
+    ``False``, then the return value is
+    a :class:`ParseResults` containing any results names that
+    were originally matched, and a single token containing the original
+    matched text from the input string.  So if the expression passed to
+    :class:`original_text_for` contains expressions with defined
+    results names, you must set ``as_string`` to ``False`` if you
+    want to preserve those results name values.
+
+    The ``asString`` pre-PEP8 argument is retained for compatibility,
+    but will be removed in a future release.
+
+    Example::
+
+        src = "this is test <b> bold <i>text</i> </b> normal text "
+        for tag in ("b", "i"):
+            opener, closer = make_html_tags(tag)
+            patt = original_text_for(opener + ... + closer)
+            print(patt.search_string(src)[0])
+
+    prints::
+
+        ['<b> bold <i>text</i> </b>']
+        ['<i>text</i>']
+    """
+    asString = asString and as_string
+
+    locMarker = Empty().set_parse_action(lambda s, loc, t: loc)
+    endlocMarker = locMarker.copy()
+    endlocMarker.callPreparse = False
+    matchExpr = locMarker("_original_start") + expr + endlocMarker("_original_end")
+    if asString:
+        extractText = lambda s, l, t: s[t._original_start : t._original_end]
+    else:
+
+        def extractText(s, l, t):
+            t[:] = [s[t.pop("_original_start") : t.pop("_original_end")]]
+
+    matchExpr.set_parse_action(extractText)
+    matchExpr.ignoreExprs = expr.ignoreExprs
+    matchExpr.suppress_warning(Diagnostics.warn_ungrouped_named_tokens_in_collection)
+    return matchExpr
+
+
+def ungroup(expr: ParserElement) -> ParserElement:
+    """Helper to undo pyparsing's default grouping of And expressions,
+    even if all but one are non-empty.
+    """
+    return TokenConverter(expr).add_parse_action(lambda t: t[0])
+
+
+def locatedExpr(expr: ParserElement) -> ParserElement:
+    """
+    (DEPRECATED - future code should use the :class:`Located` class)
+    Helper to decorate a returned token with its starting and ending
+    locations in the input string.
+
+    This helper adds the following results names:
+
+    - ``locn_start`` - location where matched expression begins
+    - ``locn_end`` - location where matched expression ends
+    - ``value`` - the actual parsed results
+
+    Be careful if the input text contains ``<TAB>`` characters, you
+    may want to call :class:`ParserElement.parse_with_tabs`
+
+    Example::
+
+        wd = Word(alphas)
+        for match in locatedExpr(wd).search_string("ljsdf123lksdjjf123lkkjj1222"):
+            print(match)
+
+    prints::
+
+        [[0, 'ljsdf', 5]]
+        [[8, 'lksdjjf', 15]]
+        [[18, 'lkkjj', 23]]
+    """
+    locator = Empty().set_parse_action(lambda ss, ll, tt: ll)
+    return Group(
+        locator("locn_start")
+        + expr("value")
+        + locator.copy().leaveWhitespace()("locn_end")
+    )
+
+
+def nested_expr(
+    opener: Union[str, ParserElement] = "(",
+    closer: Union[str, ParserElement] = ")",
+    content: typing.Optional[ParserElement] = None,
+    ignore_expr: ParserElement = quoted_string(),
     *,
-    _anchor: str | None = None,
-    _method: str | None = None,
-    _scheme: str | None = None,
-    _external: bool | None = None,
-    **values: t.Any,
-) -> str:
-    """Generate a URL to the given endpoint with the given values.
+    ignoreExpr: ParserElement = quoted_string(),
+) -> ParserElement:
+    """Helper method for defining nested lists enclosed in opening and
+    closing delimiters (``"("`` and ``")"`` are the default).
 
-    This requires an active request or application context, and calls
-    :meth:`current_app.url_for() <flask.Flask.url_for>`. See that method
-    for full documentation.
+    Parameters:
 
-    :param endpoint: The endpoint name associated with the URL to
-        generate. If this starts with a ``.``, the current blueprint
-        name (if any) will be used.
-    :param _anchor: If given, append this as ``#anchor`` to the URL.
-    :param _method: If given, generate the URL associated with this
-        method for the endpoint.
-    :param _scheme: If given, the URL will have this scheme if it is
-        external.
-    :param _external: If given, prefer the URL to be internal (False) or
-        require it to be external (True). External URLs include the
-        scheme and domain. When not in an active request, URLs are
-        external by default.
-    :param values: Values to use for the variable parts of the URL rule.
-        Unknown keys are appended as query string arguments, like
-        ``?a=b&c=d``.
+    - ``opener`` - opening character for a nested list
+      (default= ``"("``); can also be a pyparsing expression
+    - ``closer`` - closing character for a nested list
+      (default= ``")"``); can also be a pyparsing expression
+    - ``content`` - expression for items within the nested lists
+      (default= ``None``)
+    - ``ignore_expr`` - expression for ignoring opening and closing delimiters
+      (default= :class:`quoted_string`)
+    - ``ignoreExpr`` - this pre-PEP8 argument is retained for compatibility
+      but will be removed in a future release
 
-    .. versionchanged:: 2.2
-        Calls ``current_app.url_for``, allowing an app to override the
-        behavior.
+    If an expression is not provided for the content argument, the
+    nested expression will capture all whitespace-delimited content
+    between delimiters as a list of separate values.
 
-    .. versionchanged:: 0.10
-       The ``_scheme`` parameter was added.
+    Use the ``ignore_expr`` argument to define expressions that may
+    contain opening or closing characters that should not be treated as
+    opening or closing characters for nesting, such as quoted_string or
+    a comment expression.  Specify multiple expressions using an
+    :class:`Or` or :class:`MatchFirst`. The default is
+    :class:`quoted_string`, but if no expressions are to be ignored, then
+    pass ``None`` for this argument.
 
-    .. versionchanged:: 0.9
-       The ``_anchor`` and ``_method`` parameters were added.
+    Example::
 
-    .. versionchanged:: 0.9
-       Calls ``app.handle_url_build_error`` on build errors.
+        data_type = one_of("void int short long char float double")
+        decl_data_type = Combine(data_type + Opt(Word('*')))
+        ident = Word(alphas+'_', alphanums+'_')
+        number = pyparsing_common.number
+        arg = Group(decl_data_type + ident)
+        LPAR, RPAR = map(Suppress, "()")
+
+        code_body = nested_expr('{', '}', ignore_expr=(quoted_string | c_style_comment))
+
+        c_function = (decl_data_type("type")
+                      + ident("name")
+                      + LPAR + Opt(DelimitedList(arg), [])("args") + RPAR
+                      + code_body("body"))
+        c_function.ignore(c_style_comment)
+
+        source_code = '''
+            int is_odd(int x) {
+                return (x%2);
+            }
+
+            int dec_to_hex(char hchar) {
+                if (hchar >= '0' && hchar <= '9') {
+                    return (ord(hchar)-ord('0'));
+                } else {
+                    return (10+ord(hchar)-ord('A'));
+                }
+            }
+        '''
+        for func in c_function.search_string(source_code):
+            print("%(name)s (%(type)s) args: %(args)s" % func)
+
+
+    prints::
+
+        is_odd (int) args: [['int', 'x']]
+        dec_to_hex (int) args: [['char', 'hchar']]
     """
-    return current_app.url_for(
-        endpoint,
-        _anchor=_anchor,
-        _method=_method,
-        _scheme=_scheme,
-        _external=_external,
-        **values,
-    )
+    if ignoreExpr != ignore_expr:
+        ignoreExpr = ignore_expr if ignoreExpr == quoted_string() else ignoreExpr
+    if opener == closer:
+        raise ValueError("opening and closing strings cannot be the same")
+    if content is None:
+        if isinstance(opener, str_type) and isinstance(closer, str_type):
+            opener = typing.cast(str, opener)
+            closer = typing.cast(str, closer)
+            if len(opener) == 1 and len(closer) == 1:
+                if ignoreExpr is not None:
+                    content = Combine(
+                        OneOrMore(
+                            ~ignoreExpr
+                            + CharsNotIn(
+                                opener + closer + ParserElement.DEFAULT_WHITE_CHARS,
+                                exact=1,
+                            )
+                        )
+                    ).set_parse_action(lambda t: t[0].strip())
+                else:
+                    content = empty.copy() + CharsNotIn(
+                        opener + closer + ParserElement.DEFAULT_WHITE_CHARS
+                    ).set_parse_action(lambda t: t[0].strip())
+            else:
+                if ignoreExpr is not None:
+                    content = Combine(
+                        OneOrMore(
+                            ~ignoreExpr
+                            + ~Literal(opener)
+                            + ~Literal(closer)
+                            + CharsNotIn(ParserElement.DEFAULT_WHITE_CHARS, exact=1)
+                        )
+                    ).set_parse_action(lambda t: t[0].strip())
+                else:
+                    content = Combine(
+                        OneOrMore(
+                            ~Literal(opener)
+                            + ~Literal(closer)
+                            + CharsNotIn(ParserElement.DEFAULT_WHITE_CHARS, exact=1)
+                        )
+                    ).set_parse_action(lambda t: t[0].strip())
+        else:
+            raise ValueError(
+                "opening and closing arguments must be strings if no content expression is given"
+            )
+    ret = Forward()
+    if ignoreExpr is not None:
+        ret <<= Group(
+            Suppress(opener) + ZeroOrMore(ignoreExpr | ret | content) + Suppress(closer)
+        )
+    else:
+        ret <<= Group(Suppress(opener) + ZeroOrMore(ret | content) + Suppress(closer))
+    ret.set_name("nested %s%s expression" % (opener, closer))
+    return ret
 
 
-def redirect(
-    location: str, code: int = 302, Response: type[BaseResponse] | None = None
-) -> BaseResponse:
-    """Create a redirect response object.
+def _makeTags(tagStr, xml, suppress_LT=Suppress("<"), suppress_GT=Suppress(">")):
+    """Internal helper to construct opening and closing tag expressions, given a tag name"""
+    if isinstance(tagStr, str_type):
+        resname = tagStr
+        tagStr = Keyword(tagStr, caseless=not xml)
+    else:
+        resname = tagStr.name
 
-    If :data:`~flask.current_app` is available, it will use its
-    :meth:`~flask.Flask.redirect` method, otherwise it will use
-    :func:`werkzeug.utils.redirect`.
+    tagAttrName = Word(alphas, alphanums + "_-:")
+    if xml:
+        tagAttrValue = dbl_quoted_string.copy().set_parse_action(remove_quotes)
+        openTag = (
+            suppress_LT
+            + tagStr("tag")
+            + Dict(ZeroOrMore(Group(tagAttrName + Suppress("=") + tagAttrValue)))
+            + Opt("/", default=[False])("empty").set_parse_action(
+                lambda s, l, t: t[0] == "/"
+            )
+            + suppress_GT
+        )
+    else:
+        tagAttrValue = quoted_string.copy().set_parse_action(remove_quotes) | Word(
+            printables, exclude_chars=">"
+        )
+        openTag = (
+            suppress_LT
+            + tagStr("tag")
+            + Dict(
+                ZeroOrMore(
+                    Group(
+                        tagAttrName.set_parse_action(lambda t: t[0].lower())
+                        + Opt(Suppress("=") + tagAttrValue)
+                    )
+                )
+            )
+            + Opt("/", default=[False])("empty").set_parse_action(
+                lambda s, l, t: t[0] == "/"
+            )
+            + suppress_GT
+        )
+    closeTag = Combine(Literal("</") + tagStr + ">", adjacent=False)
 
-    :param location: The URL to redirect to.
-    :param code: The status code for the redirect.
-    :param Response: The response class to use. Not used when
-        ``current_app`` is active, which uses ``app.response_class``.
-
-    .. versionadded:: 2.2
-        Calls ``current_app.redirect`` if available instead of always
-        using Werkzeug's default ``redirect``.
-    """
-    if current_app:
-        return current_app.redirect(location, code=code)
-
-    return _wz_redirect(location, code=code, Response=Response)
-
-
-def abort(code: int | BaseResponse, *args: t.Any, **kwargs: t.Any) -> t.NoReturn:
-    """Raise an :exc:`~werkzeug.exceptions.HTTPException` for the given
-    status code.
-
-    If :data:`~flask.current_app` is available, it will call its
-    :attr:`~flask.Flask.aborter` object, otherwise it will use
-    :func:`werkzeug.exceptions.abort`.
-
-    :param code: The status code for the exception, which must be
-        registered in ``app.aborter``.
-    :param args: Passed to the exception.
-    :param kwargs: Passed to the exception.
-
-    .. versionadded:: 2.2
-        Calls ``current_app.aborter`` if available instead of always
-        using Werkzeug's default ``abort``.
-    """
-    if current_app:
-        current_app.aborter(code, *args, **kwargs)
-
-    _wz_abort(code, *args, **kwargs)
-
-
-def get_template_attribute(template_name: str, attribute: str) -> t.Any:
-    """Loads a macro (or variable) a template exports.  This can be used to
-    invoke a macro from within Python code.  If you for example have a
-    template named :file:`_cider.html` with the following contents:
-
-    .. sourcecode:: html+jinja
-
-       {% macro hello(name) %}Hello {{ name }}!{% endmacro %}
-
-    You can access this from Python code like this::
-
-        hello = get_template_attribute('_cider.html', 'hello')
-        return hello('World')
-
-    .. versionadded:: 0.2
-
-    :param template_name: the name of the template
-    :param attribute: the name of the variable of macro to access
-    """
-    return getattr(current_app.jinja_env.get_template(template_name).module, attribute)
-
-
-def flash(message: str, category: str = "message") -> None:
-    """Flashes a message to the next request.  In order to remove the
-    flashed message from the session and to display it to the user,
-    the template has to call :func:`get_flashed_messages`.
-
-    .. versionchanged:: 0.3
-       `category` parameter added.
-
-    :param message: the message to be flashed.
-    :param category: the category for the message.  The following values
-                     are recommended: ``'message'`` for any kind of message,
-                     ``'error'`` for errors, ``'info'`` for information
-                     messages and ``'warning'`` for warnings.  However any
-                     kind of string can be used as category.
-    """
-    # Original implementation:
-    #
-    #     session.setdefault('_flashes', []).append((category, message))
-    #
-    # This assumed that changes made to mutable structures in the session are
-    # always in sync with the session object, which is not true for session
-    # implementations that use external storage for keeping their keys/values.
-    flashes = session.get("_flashes", [])
-    flashes.append((category, message))
-    session["_flashes"] = flashes
-    app = current_app._get_current_object()  # type: ignore
-    message_flashed.send(
-        app,
-        _async_wrapper=app.ensure_sync,
-        message=message,
-        category=category,
-    )
-
-
-def get_flashed_messages(
-    with_categories: bool = False, category_filter: t.Iterable[str] = ()
-) -> list[str] | list[tuple[str, str]]:
-    """Pulls all flashed messages from the session and returns them.
-    Further calls in the same request to the function will return
-    the same messages.  By default just the messages are returned,
-    but when `with_categories` is set to ``True``, the return value will
-    be a list of tuples in the form ``(category, message)`` instead.
-
-    Filter the flashed messages to one or more categories by providing those
-    categories in `category_filter`.  This allows rendering categories in
-    separate html blocks.  The `with_categories` and `category_filter`
-    arguments are distinct:
-
-    * `with_categories` controls whether categories are returned with message
-      text (``True`` gives a tuple, where ``False`` gives just the message text).
-    * `category_filter` filters the messages down to only those matching the
-      provided categories.
-
-    See :doc:`/patterns/flashing` for examples.
-
-    .. versionchanged:: 0.3
-       `with_categories` parameter added.
-
-    .. versionchanged:: 0.9
-        `category_filter` parameter added.
-
-    :param with_categories: set to ``True`` to also receive categories.
-    :param category_filter: filter of categories to limit return values.  Only
-                            categories in the list will be returned.
-    """
-    flashes = request_ctx.flashes
-    if flashes is None:
-        flashes = session.pop("_flashes") if "_flashes" in session else []
-        request_ctx.flashes = flashes
-    if category_filter:
-        flashes = list(filter(lambda f: f[0] in category_filter, flashes))
-    if not with_categories:
-        return [x[1] for x in flashes]
-    return flashes
-
-
-def _prepare_send_file_kwargs(**kwargs: t.Any) -> dict[str, t.Any]:
-    if kwargs.get("max_age") is None:
-        kwargs["max_age"] = current_app.get_send_file_max_age
-
-    kwargs.update(
-        environ=request.environ,
-        use_x_sendfile=current_app.config["USE_X_SENDFILE"],
-        response_class=current_app.response_class,
-        _root_path=current_app.root_path,
-    )
-    return kwargs
-
-
-def send_file(
-    path_or_file: os.PathLike[t.AnyStr] | str | t.IO[bytes],
-    mimetype: str | None = None,
-    as_attachment: bool = False,
-    download_name: str | None = None,
-    conditional: bool = True,
-    etag: bool | str = True,
-    last_modified: datetime | int | float | None = None,
-    max_age: None | (int | t.Callable[[str | None], int | None]) = None,
-) -> Response:
-    """Send the contents of a file to the client.
-
-    The first argument can be a file path or a file-like object. Paths
-    are preferred in most cases because Werkzeug can manage the file and
-    get extra information from the path. Passing a file-like object
-    requires that the file is opened in binary mode, and is mostly
-    useful when building a file in memory with :class:`io.BytesIO`.
-
-    Never pass file paths provided by a user. The path is assumed to be
-    trusted, so a user could craft a path to access a file you didn't
-    intend. Use :func:`send_from_directory` to safely serve
-    user-requested paths from within a directory.
-
-    If the WSGI server sets a ``file_wrapper`` in ``environ``, it is
-    used, otherwise Werkzeug's built-in wrapper is used. Alternatively,
-    if the HTTP server supports ``X-Sendfile``, configuring Flask with
-    ``USE_X_SENDFILE = True`` will tell the server to send the given
-    path, which is much more efficient than reading it in Python.
-
-    :param path_or_file: The path to the file to send, relative to the
-        current working directory if a relative path is given.
-        Alternatively, a file-like object opened in binary mode. Make
-        sure the file pointer is seeked to the start of the data.
-    :param mimetype: The MIME type to send for the file. If not
-        provided, it will try to detect it from the file name.
-    :param as_attachment: Indicate to a browser that it should offer to
-        save the file instead of displaying it.
-    :param download_name: The default name browsers will use when saving
-        the file. Defaults to the passed file name.
-    :param conditional: Enable conditional and range responses based on
-        request headers. Requires passing a file path and ``environ``.
-    :param etag: Calculate an ETag for the file, which requires passing
-        a file path. Can also be a string to use instead.
-    :param last_modified: The last modified time to send for the file,
-        in seconds. If not provided, it will try to detect it from the
-        file path.
-    :param max_age: How long the client should cache the file, in
-        seconds. If set, ``Cache-Control`` will be ``public``, otherwise
-        it will be ``no-cache`` to prefer conditional caching.
-
-    .. versionchanged:: 2.0
-        ``download_name`` replaces the ``attachment_filename``
-        parameter. If ``as_attachment=False``, it is passed with
-        ``Content-Disposition: inline`` instead.
-
-    .. versionchanged:: 2.0
-        ``max_age`` replaces the ``cache_timeout`` parameter.
-        ``conditional`` is enabled and ``max_age`` is not set by
-        default.
-
-    .. versionchanged:: 2.0
-        ``etag`` replaces the ``add_etags`` parameter. It can be a
-        string to use instead of generating one.
-
-    .. versionchanged:: 2.0
-        Passing a file-like object that inherits from
-        :class:`~io.TextIOBase` will raise a :exc:`ValueError` rather
-        than sending an empty file.
-
-    .. versionadded:: 2.0
-        Moved the implementation to Werkzeug. This is now a wrapper to
-        pass some Flask-specific arguments.
-
-    .. versionchanged:: 1.1
-        ``filename`` may be a :class:`~os.PathLike` object.
-
-    .. versionchanged:: 1.1
-        Passing a :class:`~io.BytesIO` object supports range requests.
-
-    .. versionchanged:: 1.0.3
-        Filenames are encoded with ASCII instead of Latin-1 for broader
-        compatibility with WSGI servers.
-
-    .. versionchanged:: 1.0
-        UTF-8 filenames as specified in :rfc:`2231` are supported.
-
-    .. versionchanged:: 0.12
-        The filename is no longer automatically inferred from file
-        objects. If you want to use automatic MIME and etag support,
-        pass a filename via ``filename_or_fp`` or
-        ``attachment_filename``.
-
-    .. versionchanged:: 0.12
-        ``attachment_filename`` is preferred over ``filename`` for MIME
-        detection.
-
-    .. versionchanged:: 0.9
-        ``cache_timeout`` defaults to
-        :meth:`Flask.get_send_file_max_age`.
-
-    .. versionchanged:: 0.7
-        MIME guessing and etag support for file-like objects was
-        removed because it was unreliable. Pass a filename if you are
-        able to, otherwise attach an etag yourself.
-
-    .. versionchanged:: 0.5
-        The ``add_etags``, ``cache_timeout`` and ``conditional``
-        parameters were added. The default behavior is to add etags.
-
-    .. versionadded:: 0.2
-    """
-    return werkzeug.utils.send_file(  # type: ignore[return-value]
-        **_prepare_send_file_kwargs(
-            path_or_file=path_or_file,
-            environ=request.environ,
-            mimetype=mimetype,
-            as_attachment=as_attachment,
-            download_name=download_name,
-            conditional=conditional,
-            etag=etag,
-            last_modified=last_modified,
-            max_age=max_age,
+    openTag.set_name("<%s>" % resname)
+    # add start<tagname> results name in parse action now that ungrouped names are not reported at two levels
+    openTag.add_parse_action(
+        lambda t: t.__setitem__(
+            "start" + "".join(resname.replace(":", " ").title().split()), t.copy()
         )
     )
+    closeTag = closeTag(
+        "end" + "".join(resname.replace(":", " ").title().split())
+    ).set_name("</%s>" % resname)
+    openTag.tag = resname
+    closeTag.tag = resname
+    openTag.tag_body = SkipTo(closeTag())
+    return openTag, closeTag
 
 
-def send_from_directory(
-    directory: os.PathLike[str] | str,
-    path: os.PathLike[str] | str,
-    **kwargs: t.Any,
-) -> Response:
-    """Send a file from within a directory using :func:`send_file`.
+def make_html_tags(
+    tag_str: Union[str, ParserElement]
+) -> Tuple[ParserElement, ParserElement]:
+    """Helper to construct opening and closing tag expressions for HTML,
+    given a tag name. Matches tags in either upper or lower case,
+    attributes with namespaces and with quoted or unquoted values.
 
-    .. code-block:: python
+    Example::
 
-        @app.route("/uploads/<path:name>")
-        def download_file(name):
-            return send_from_directory(
-                app.config['UPLOAD_FOLDER'], name, as_attachment=True
-            )
+        text = '<td>More info at the <a href="https://github.com/pyparsing/pyparsing/wiki">pyparsing</a> wiki page</td>'
+        # make_html_tags returns pyparsing expressions for the opening and
+        # closing tags as a 2-tuple
+        a, a_end = make_html_tags("A")
+        link_expr = a + SkipTo(a_end)("link_text") + a_end
 
-    This is a secure way to serve files from a folder, such as static
-    files or uploads. Uses :func:`~werkzeug.security.safe_join` to
-    ensure the path coming from the client is not maliciously crafted to
-    point outside the specified directory.
+        for link in link_expr.search_string(text):
+            # attributes in the <A> tag (like "href" shown here) are
+            # also accessible as named results
+            print(link.link_text, '->', link.href)
 
-    If the final path does not point to an existing regular file,
-    raises a 404 :exc:`~werkzeug.exceptions.NotFound` error.
+    prints::
 
-    :param directory: The directory that ``path`` must be located under,
-        relative to the current application's root path. This *must not*
-        be a value provided by the client, otherwise it becomes insecure.
-    :param path: The path to the file to send, relative to
-        ``directory``.
-    :param kwargs: Arguments to pass to :func:`send_file`.
-
-    .. versionchanged:: 2.0
-        ``path`` replaces the ``filename`` parameter.
-
-    .. versionadded:: 2.0
-        Moved the implementation to Werkzeug. This is now a wrapper to
-        pass some Flask-specific arguments.
-
-    .. versionadded:: 0.5
+        pyparsing -> https://github.com/pyparsing/pyparsing/wiki
     """
-    return werkzeug.utils.send_from_directory(  # type: ignore[return-value]
-        directory, path, **_prepare_send_file_kwargs(**kwargs)
+    return _makeTags(tag_str, False)
+
+
+def make_xml_tags(
+    tag_str: Union[str, ParserElement]
+) -> Tuple[ParserElement, ParserElement]:
+    """Helper to construct opening and closing tag expressions for XML,
+    given a tag name. Matches tags only in the given upper/lower case.
+
+    Example: similar to :class:`make_html_tags`
+    """
+    return _makeTags(tag_str, True)
+
+
+any_open_tag: ParserElement
+any_close_tag: ParserElement
+any_open_tag, any_close_tag = make_html_tags(
+    Word(alphas, alphanums + "_:").set_name("any tag")
+)
+
+_htmlEntityMap = {k.rstrip(";"): v for k, v in html.entities.html5.items()}
+common_html_entity = Regex("&(?P<entity>" + "|".join(_htmlEntityMap) + ");").set_name(
+    "common HTML entity"
+)
+
+
+def replace_html_entity(s, l, t):
+    """Helper parser action to replace common HTML entities with their special characters"""
+    return _htmlEntityMap.get(t.entity)
+
+
+class OpAssoc(Enum):
+    """Enumeration of operator associativity
+    - used in constructing InfixNotationOperatorSpec for :class:`infix_notation`"""
+
+    LEFT = 1
+    RIGHT = 2
+
+
+InfixNotationOperatorArgType = Union[
+    ParserElement, str, Tuple[Union[ParserElement, str], Union[ParserElement, str]]
+]
+InfixNotationOperatorSpec = Union[
+    Tuple[
+        InfixNotationOperatorArgType,
+        int,
+        OpAssoc,
+        typing.Optional[ParseAction],
+    ],
+    Tuple[
+        InfixNotationOperatorArgType,
+        int,
+        OpAssoc,
+    ],
+]
+
+
+def infix_notation(
+    base_expr: ParserElement,
+    op_list: List[InfixNotationOperatorSpec],
+    lpar: Union[str, ParserElement] = Suppress("("),
+    rpar: Union[str, ParserElement] = Suppress(")"),
+) -> ParserElement:
+    """Helper method for constructing grammars of expressions made up of
+    operators working in a precedence hierarchy.  Operators may be unary
+    or binary, left- or right-associative.  Parse actions can also be
+    attached to operator expressions. The generated parser will also
+    recognize the use of parentheses to override operator precedences
+    (see example below).
+
+    Note: if you define a deep operator list, you may see performance
+    issues when using infix_notation. See
+    :class:`ParserElement.enable_packrat` for a mechanism to potentially
+    improve your parser performance.
+
+    Parameters:
+
+    - ``base_expr`` - expression representing the most basic operand to
+      be used in the expression
+    - ``op_list`` - list of tuples, one for each operator precedence level
+      in the expression grammar; each tuple is of the form ``(op_expr,
+      num_operands, right_left_assoc, (optional)parse_action)``, where:
+
+      - ``op_expr`` is the pyparsing expression for the operator; may also
+        be a string, which will be converted to a Literal; if ``num_operands``
+        is 3, ``op_expr`` is a tuple of two expressions, for the two
+        operators separating the 3 terms
+      - ``num_operands`` is the number of terms for this operator (must be 1,
+        2, or 3)
+      - ``right_left_assoc`` is the indicator whether the operator is right
+        or left associative, using the pyparsing-defined constants
+        ``OpAssoc.RIGHT`` and ``OpAssoc.LEFT``.
+      - ``parse_action`` is the parse action to be associated with
+        expressions matching this operator expression (the parse action
+        tuple member may be omitted); if the parse action is passed
+        a tuple or list of functions, this is equivalent to calling
+        ``set_parse_action(*fn)``
+        (:class:`ParserElement.set_parse_action`)
+    - ``lpar`` - expression for matching left-parentheses; if passed as a
+      str, then will be parsed as ``Suppress(lpar)``. If lpar is passed as
+      an expression (such as ``Literal('(')``), then it will be kept in
+      the parsed results, and grouped with them. (default= ``Suppress('(')``)
+    - ``rpar`` - expression for matching right-parentheses; if passed as a
+      str, then will be parsed as ``Suppress(rpar)``. If rpar is passed as
+      an expression (such as ``Literal(')')``), then it will be kept in
+      the parsed results, and grouped with them. (default= ``Suppress(')')``)
+
+    Example::
+
+        # simple example of four-function arithmetic with ints and
+        # variable names
+        integer = pyparsing_common.signed_integer
+        varname = pyparsing_common.identifier
+
+        arith_expr = infix_notation(integer | varname,
+            [
+            ('-', 1, OpAssoc.RIGHT),
+            (one_of('* /'), 2, OpAssoc.LEFT),
+            (one_of('+ -'), 2, OpAssoc.LEFT),
+            ])
+
+        arith_expr.run_tests('''
+            5+3*6
+            (5+3)*6
+            -2--11
+            ''', full_dump=False)
+
+    prints::
+
+        5+3*6
+        [[5, '+', [3, '*', 6]]]
+
+        (5+3)*6
+        [[[5, '+', 3], '*', 6]]
+
+        (5+x)*y
+        [[[5, '+', 'x'], '*', 'y']]
+
+        -2--11
+        [[['-', 2], '-', ['-', 11]]]
+    """
+
+    # captive version of FollowedBy that does not do parse actions or capture results names
+    class _FB(FollowedBy):
+        def parseImpl(self, instring, loc, doActions=True):
+            self.expr.try_parse(instring, loc)
+            return loc, []
+
+    _FB.__name__ = "FollowedBy>"
+
+    ret = Forward()
+    if isinstance(lpar, str):
+        lpar = Suppress(lpar)
+    if isinstance(rpar, str):
+        rpar = Suppress(rpar)
+
+    # if lpar and rpar are not suppressed, wrap in group
+    if not (isinstance(rpar, Suppress) and isinstance(rpar, Suppress)):
+        lastExpr = base_expr | Group(lpar + ret + rpar)
+    else:
+        lastExpr = base_expr | (lpar + ret + rpar)
+
+    arity: int
+    rightLeftAssoc: opAssoc
+    pa: typing.Optional[ParseAction]
+    opExpr1: ParserElement
+    opExpr2: ParserElement
+    for i, operDef in enumerate(op_list):
+        opExpr, arity, rightLeftAssoc, pa = (operDef + (None,))[:4]  # type: ignore[assignment]
+        if isinstance(opExpr, str_type):
+            opExpr = ParserElement._literalStringClass(opExpr)
+        opExpr = typing.cast(ParserElement, opExpr)
+        if arity == 3:
+            if not isinstance(opExpr, (tuple, list)) or len(opExpr) != 2:
+                raise ValueError(
+                    "if numterms=3, opExpr must be a tuple or list of two expressions"
+                )
+            opExpr1, opExpr2 = opExpr
+            term_name = f"{opExpr1}{opExpr2} term"
+        else:
+            term_name = f"{opExpr} term"
+
+        if not 1 <= arity <= 3:
+            raise ValueError("operator must be unary (1), binary (2), or ternary (3)")
+
+        if rightLeftAssoc not in (OpAssoc.LEFT, OpAssoc.RIGHT):
+            raise ValueError("operator must indicate right or left associativity")
+
+        thisExpr: ParserElement = Forward().set_name(term_name)
+        thisExpr = typing.cast(Forward, thisExpr)
+        if rightLeftAssoc is OpAssoc.LEFT:
+            if arity == 1:
+                matchExpr = _FB(lastExpr + opExpr) + Group(lastExpr + opExpr[1, ...])
+            elif arity == 2:
+                if opExpr is not None:
+                    matchExpr = _FB(lastExpr + opExpr + lastExpr) + Group(
+                        lastExpr + (opExpr + lastExpr)[1, ...]
+                    )
+                else:
+                    matchExpr = _FB(lastExpr + lastExpr) + Group(lastExpr[2, ...])
+            elif arity == 3:
+                matchExpr = _FB(
+                    lastExpr + opExpr1 + lastExpr + opExpr2 + lastExpr
+                ) + Group(lastExpr + OneOrMore(opExpr1 + lastExpr + opExpr2 + lastExpr))
+        elif rightLeftAssoc is OpAssoc.RIGHT:
+            if arity == 1:
+                # try to avoid LR with this extra test
+                if not isinstance(opExpr, Opt):
+                    opExpr = Opt(opExpr)
+                matchExpr = _FB(opExpr.expr + thisExpr) + Group(opExpr + thisExpr)
+            elif arity == 2:
+                if opExpr is not None:
+                    matchExpr = _FB(lastExpr + opExpr + thisExpr) + Group(
+                        lastExpr + (opExpr + thisExpr)[1, ...]
+                    )
+                else:
+                    matchExpr = _FB(lastExpr + thisExpr) + Group(
+                        lastExpr + thisExpr[1, ...]
+                    )
+            elif arity == 3:
+                matchExpr = _FB(
+                    lastExpr + opExpr1 + thisExpr + opExpr2 + thisExpr
+                ) + Group(lastExpr + opExpr1 + thisExpr + opExpr2 + thisExpr)
+        if pa:
+            if isinstance(pa, (tuple, list)):
+                matchExpr.set_parse_action(*pa)
+            else:
+                matchExpr.set_parse_action(pa)
+        thisExpr <<= (matchExpr | lastExpr).setName(term_name)
+        lastExpr = thisExpr
+    ret <<= lastExpr
+    return ret
+
+
+def indentedBlock(blockStatementExpr, indentStack, indent=True, backup_stacks=[]):
+    """
+    (DEPRECATED - use :class:`IndentedBlock` class instead)
+    Helper method for defining space-delimited indentation blocks,
+    such as those used to define block statements in Python source code.
+
+    Parameters:
+
+    - ``blockStatementExpr`` - expression defining syntax of statement that
+      is repeated within the indented block
+    - ``indentStack`` - list created by caller to manage indentation stack
+      (multiple ``statementWithIndentedBlock`` expressions within a single
+      grammar should share a common ``indentStack``)
+    - ``indent`` - boolean indicating whether block must be indented beyond
+      the current level; set to ``False`` for block of left-most statements
+      (default= ``True``)
+
+    A valid block must contain at least one ``blockStatement``.
+
+    (Note that indentedBlock uses internal parse actions which make it
+    incompatible with packrat parsing.)
+
+    Example::
+
+        data = '''
+        def A(z):
+          A1
+          B = 100
+          G = A2
+          A2
+          A3
+        B
+        def BB(a,b,c):
+          BB1
+          def BBA():
+            bba1
+            bba2
+            bba3
+        C
+        D
+        def spam(x,y):
+             def eggs(z):
+                 pass
+        '''
+
+
+        indentStack = [1]
+        stmt = Forward()
+
+        identifier = Word(alphas, alphanums)
+        funcDecl = ("def" + identifier + Group("(" + Opt(delimitedList(identifier)) + ")") + ":")
+        func_body = indentedBlock(stmt, indentStack)
+        funcDef = Group(funcDecl + func_body)
+
+        rvalue = Forward()
+        funcCall = Group(identifier + "(" + Opt(delimitedList(rvalue)) + ")")
+        rvalue << (funcCall | identifier | Word(nums))
+        assignment = Group(identifier + "=" + rvalue)
+        stmt << (funcDef | assignment | identifier)
+
+        module_body = stmt[1, ...]
+
+        parseTree = module_body.parseString(data)
+        parseTree.pprint()
+
+    prints::
+
+        [['def',
+          'A',
+          ['(', 'z', ')'],
+          ':',
+          [['A1'], [['B', '=', '100']], [['G', '=', 'A2']], ['A2'], ['A3']]],
+         'B',
+         ['def',
+          'BB',
+          ['(', 'a', 'b', 'c', ')'],
+          ':',
+          [['BB1'], [['def', 'BBA', ['(', ')'], ':', [['bba1'], ['bba2'], ['bba3']]]]]],
+         'C',
+         'D',
+         ['def',
+          'spam',
+          ['(', 'x', 'y', ')'],
+          ':',
+          [[['def', 'eggs', ['(', 'z', ')'], ':', [['pass']]]]]]]
+    """
+    backup_stacks.append(indentStack[:])
+
+    def reset_stack():
+        indentStack[:] = backup_stacks[-1]
+
+    def checkPeerIndent(s, l, t):
+        if l >= len(s):
+            return
+        curCol = col(l, s)
+        if curCol != indentStack[-1]:
+            if curCol > indentStack[-1]:
+                raise ParseException(s, l, "illegal nesting")
+            raise ParseException(s, l, "not a peer entry")
+
+    def checkSubIndent(s, l, t):
+        curCol = col(l, s)
+        if curCol > indentStack[-1]:
+            indentStack.append(curCol)
+        else:
+            raise ParseException(s, l, "not a subentry")
+
+    def checkUnindent(s, l, t):
+        if l >= len(s):
+            return
+        curCol = col(l, s)
+        if not (indentStack and curCol in indentStack):
+            raise ParseException(s, l, "not an unindent")
+        if curCol < indentStack[-1]:
+            indentStack.pop()
+
+    NL = OneOrMore(LineEnd().set_whitespace_chars("\t ").suppress())
+    INDENT = (Empty() + Empty().set_parse_action(checkSubIndent)).set_name("INDENT")
+    PEER = Empty().set_parse_action(checkPeerIndent).set_name("")
+    UNDENT = Empty().set_parse_action(checkUnindent).set_name("UNINDENT")
+    if indent:
+        smExpr = Group(
+            Opt(NL)
+            + INDENT
+            + OneOrMore(PEER + Group(blockStatementExpr) + Opt(NL))
+            + UNDENT
+        )
+    else:
+        smExpr = Group(
+            Opt(NL)
+            + OneOrMore(PEER + Group(blockStatementExpr) + Opt(NL))
+            + Opt(UNDENT)
+        )
+
+    # add a parse action to remove backup_stack from list of backups
+    smExpr.add_parse_action(
+        lambda: backup_stacks.pop(-1) and None if backup_stacks else None
+    )
+    smExpr.set_fail_action(lambda a, b, c, d: reset_stack())
+    blockStatementExpr.ignore(_bslash + LineEnd())
+    return smExpr.set_name("indented block")
+
+
+# it's easy to get these comment structures wrong - they're very common, so may as well make them available
+c_style_comment = Combine(Regex(r"/\*(?:[^*]|\*(?!/))*") + "*/").set_name(
+    "C style comment"
+)
+"Comment of the form ``/* ... */``"
+
+html_comment = Regex(r"<!--[\s\S]*?-->").set_name("HTML comment")
+"Comment of the form ``<!-- ... -->``"
+
+rest_of_line = Regex(r".*").leave_whitespace().set_name("rest of line")
+dbl_slash_comment = Regex(r"//(?:\\\n|[^\n])*").set_name("// comment")
+"Comment of the form ``// ... (to end of line)``"
+
+cpp_style_comment = Combine(
+    Regex(r"/\*(?:[^*]|\*(?!/))*") + "*/" | dbl_slash_comment
+).set_name("C++ style comment")
+"Comment of either form :class:`c_style_comment` or :class:`dbl_slash_comment`"
+
+java_style_comment = cpp_style_comment
+"Same as :class:`cpp_style_comment`"
+
+python_style_comment = Regex(r"#.*").set_name("Python style comment")
+"Comment of the form ``# ... (to end of line)``"
+
+
+# build list of built-in expressions, for future reference if a global default value
+# gets updated
+_builtin_exprs: List[ParserElement] = [
+    v for v in vars().values() if isinstance(v, ParserElement)
+]
+
+
+# compatibility function, superseded by DelimitedList class
+def delimited_list(
+    expr: Union[str, ParserElement],
+    delim: Union[str, ParserElement] = ",",
+    combine: bool = False,
+    min: typing.Optional[int] = None,
+    max: typing.Optional[int] = None,
+    *,
+    allow_trailing_delim: bool = False,
+) -> ParserElement:
+    """(DEPRECATED - use :class:`DelimitedList` class)"""
+    return DelimitedList(
+        expr, delim, combine, min, max, allow_trailing_delim=allow_trailing_delim
     )
 
 
-def get_root_path(import_name: str) -> str:
-    """Find the root path of a package, or the path that contains a
-    module. If it cannot be found, returns the current working
-    directory.
+# pre-PEP8 compatible names
+# fmt: off
+opAssoc = OpAssoc
+anyOpenTag = any_open_tag
+anyCloseTag = any_close_tag
+commonHTMLEntity = common_html_entity
+cStyleComment = c_style_comment
+htmlComment = html_comment
+restOfLine = rest_of_line
+dblSlashComment = dbl_slash_comment
+cppStyleComment = cpp_style_comment
+javaStyleComment = java_style_comment
+pythonStyleComment = python_style_comment
 
-    Not to be confused with the value returned by :func:`find_package`.
+@replaced_by_pep8(DelimitedList)
+def delimitedList(): ...
 
-    :meta private:
-    """
-    # Module already imported and has a file attribute. Use that first.
-    mod = sys.modules.get(import_name)
+@replaced_by_pep8(DelimitedList)
+def delimited_list(): ...
 
-    if mod is not None and hasattr(mod, "__file__") and mod.__file__ is not None:
-        return os.path.dirname(os.path.abspath(mod.__file__))
+@replaced_by_pep8(counted_array)
+def countedArray(): ...
 
-    # Next attempt: check the loader.
-    try:
-        spec = importlib.util.find_spec(import_name)
+@replaced_by_pep8(match_previous_literal)
+def matchPreviousLiteral(): ...
 
-        if spec is None:
-            raise ValueError
-    except (ImportError, ValueError):
-        loader = None
-    else:
-        loader = spec.loader
+@replaced_by_pep8(match_previous_expr)
+def matchPreviousExpr(): ...
 
-    # Loader does not exist or we're referring to an unloaded main
-    # module or a main module without path (interactive sessions), go
-    # with the current working directory.
-    if loader is None:
-        return os.getcwd()
+@replaced_by_pep8(one_of)
+def oneOf(): ...
 
-    if hasattr(loader, "get_filename"):
-        filepath = loader.get_filename(import_name)  # pyright: ignore
-    else:
-        # Fall back to imports.
-        __import__(import_name)
-        mod = sys.modules[import_name]
-        filepath = getattr(mod, "__file__", None)
+@replaced_by_pep8(dict_of)
+def dictOf(): ...
 
-        # If we don't have a file path it might be because it is a
-        # namespace package. In this case pick the root path from the
-        # first module that is contained in the package.
-        if filepath is None:
-            raise RuntimeError(
-                "No root path can be found for the provided module"
-                f" {import_name!r}. This can happen because the module"
-                " came from an import hook that does not provide file"
-                " name information or because it's a namespace package."
-                " In this case the root path needs to be explicitly"
-                " provided."
-            )
+@replaced_by_pep8(original_text_for)
+def originalTextFor(): ...
 
-    # filepath is import_name.py for a module, or __init__.py for a package.
-    return os.path.dirname(os.path.abspath(filepath))  # type: ignore[no-any-return]
+@replaced_by_pep8(nested_expr)
+def nestedExpr(): ...
 
+@replaced_by_pep8(make_html_tags)
+def makeHTMLTags(): ...
 
-@cache
-def _split_blueprint_path(name: str) -> list[str]:
-    out: list[str] = [name]
+@replaced_by_pep8(make_xml_tags)
+def makeXMLTags(): ...
 
-    if "." in name:
-        out.extend(_split_blueprint_path(name.rpartition(".")[0]))
+@replaced_by_pep8(replace_html_entity)
+def replaceHTMLEntity(): ...
 
-    return out
+@replaced_by_pep8(infix_notation)
+def infixNotation(): ...
+# fmt: on
