@@ -1,256 +1,153 @@
-"""Built-in template tests used with the ``is`` operator."""
+# coding: utf-8
+"""
 
-import operator
-import typing as t
-from collections import abc
-from numbers import Number
+    webencodings.tests
+    ~~~~~~~~~~~~~~~~~~
 
-from .runtime import Undefined
-from .utils import pass_environment
+    A basic test suite for Encoding.
 
-if t.TYPE_CHECKING:
-    from .environment import Environment
+    :copyright: Copyright 2012 by Simon Sapin
+    :license: BSD, see LICENSE for details.
 
+"""
 
-def test_odd(value: int) -> bool:
-    """Return true if the variable is odd."""
-    return value % 2 == 1
+from __future__ import unicode_literals
 
-
-def test_even(value: int) -> bool:
-    """Return true if the variable is even."""
-    return value % 2 == 0
+from . import (lookup, LABELS, decode, encode, iter_decode, iter_encode,
+               IncrementalDecoder, IncrementalEncoder, UTF8)
 
 
-def test_divisibleby(value: int, num: int) -> bool:
-    """Check if a variable is divisible by a number."""
-    return value % num == 0
-
-
-def test_defined(value: t.Any) -> bool:
-    """Return true if the variable is defined:
-
-    .. sourcecode:: jinja
-
-        {% if variable is defined %}
-            value of variable: {{ variable }}
-        {% else %}
-            variable is not defined
-        {% endif %}
-
-    See the :func:`default` filter for a simple way to set undefined
-    variables.
-    """
-    return not isinstance(value, Undefined)
-
-
-def test_undefined(value: t.Any) -> bool:
-    """Like :func:`defined` but the other way round."""
-    return isinstance(value, Undefined)
-
-
-@pass_environment
-def test_filter(env: "Environment", value: str) -> bool:
-    """Check if a filter exists by name. Useful if a filter may be
-    optionally available.
-
-    .. code-block:: jinja
-
-        {% if 'markdown' is filter %}
-            {{ value | markdown }}
-        {% else %}
-            {{ value }}
-        {% endif %}
-
-    .. versionadded:: 3.0
-    """
-    return value in env.filters
-
-
-@pass_environment
-def test_test(env: "Environment", value: str) -> bool:
-    """Check if a test exists by name. Useful if a test may be
-    optionally available.
-
-    .. code-block:: jinja
-
-        {% if 'loud' is test %}
-            {% if value is loud %}
-                {{ value|upper }}
-            {% else %}
-                {{ value|lower }}
-            {% endif %}
-        {% else %}
-            {{ value }}
-        {% endif %}
-
-    .. versionadded:: 3.0
-    """
-    return value in env.tests
-
-
-def test_none(value: t.Any) -> bool:
-    """Return true if the variable is none."""
-    return value is None
-
-
-def test_boolean(value: t.Any) -> bool:
-    """Return true if the object is a boolean value.
-
-    .. versionadded:: 2.11
-    """
-    return value is True or value is False
-
-
-def test_false(value: t.Any) -> bool:
-    """Return true if the object is False.
-
-    .. versionadded:: 2.11
-    """
-    return value is False
-
-
-def test_true(value: t.Any) -> bool:
-    """Return true if the object is True.
-
-    .. versionadded:: 2.11
-    """
-    return value is True
-
-
-# NOTE: The existing 'number' test matches booleans and floats
-def test_integer(value: t.Any) -> bool:
-    """Return true if the object is an integer.
-
-    .. versionadded:: 2.11
-    """
-    return isinstance(value, int) and value is not True and value is not False
-
-
-# NOTE: The existing 'number' test matches booleans and integers
-def test_float(value: t.Any) -> bool:
-    """Return true if the object is a float.
-
-    .. versionadded:: 2.11
-    """
-    return isinstance(value, float)
-
-
-def test_lower(value: str) -> bool:
-    """Return true if the variable is lowercased."""
-    return str(value).islower()
-
-
-def test_upper(value: str) -> bool:
-    """Return true if the variable is uppercased."""
-    return str(value).isupper()
-
-
-def test_string(value: t.Any) -> bool:
-    """Return true if the object is a string."""
-    return isinstance(value, str)
-
-
-def test_mapping(value: t.Any) -> bool:
-    """Return true if the object is a mapping (dict etc.).
-
-    .. versionadded:: 2.6
-    """
-    return isinstance(value, abc.Mapping)
-
-
-def test_number(value: t.Any) -> bool:
-    """Return true if the variable is a number."""
-    return isinstance(value, Number)
-
-
-def test_sequence(value: t.Any) -> bool:
-    """Return true if the variable is a sequence. Sequences are variables
-    that are iterable.
-    """
+def assert_raises(exception, function, *args, **kwargs):
     try:
-        len(value)
-        value.__getitem__  # noqa B018
-    except Exception:
-        return False
-
-    return True
-
-
-def test_sameas(value: t.Any, other: t.Any) -> bool:
-    """Check if an object points to the same memory address than another
-    object:
-
-    .. sourcecode:: jinja
-
-        {% if foo.attribute is sameas false %}
-            the foo attribute really is the `False` singleton
-        {% endif %}
-    """
-    return value is other
+        function(*args, **kwargs)
+    except exception:
+        return
+    else:  # pragma: no cover
+        raise AssertionError('Did not raise %s.' % exception)
 
 
-def test_iterable(value: t.Any) -> bool:
-    """Check if it's possible to iterate over an object."""
-    try:
-        iter(value)
-    except TypeError:
-        return False
+def test_labels():
+    assert lookup('utf-8').name == 'utf-8'
+    assert lookup('Utf-8').name == 'utf-8'
+    assert lookup('UTF-8').name == 'utf-8'
+    assert lookup('utf8').name == 'utf-8'
+    assert lookup('utf8').name == 'utf-8'
+    assert lookup('utf8 ').name == 'utf-8'
+    assert lookup(' \r\nutf8\t').name == 'utf-8'
+    assert lookup('u8') is None  # Python label.
+    assert lookup('utf-8 ') is None  # Non-ASCII white space.
 
-    return True
-
-
-def test_escaped(value: t.Any) -> bool:
-    """Check if the value is escaped."""
-    return hasattr(value, "__html__")
-
-
-def test_in(value: t.Any, seq: t.Container[t.Any]) -> bool:
-    """Check if value is in seq.
-
-    .. versionadded:: 2.10
-    """
-    return value in seq
+    assert lookup('US-ASCII').name == 'windows-1252'
+    assert lookup('iso-8859-1').name == 'windows-1252'
+    assert lookup('latin1').name == 'windows-1252'
+    assert lookup('LATIN1').name == 'windows-1252'
+    assert lookup('latin-1') is None
+    assert lookup('LATİN1') is None  # ASCII-only case insensitivity.
 
 
-TESTS = {
-    "odd": test_odd,
-    "even": test_even,
-    "divisibleby": test_divisibleby,
-    "defined": test_defined,
-    "undefined": test_undefined,
-    "filter": test_filter,
-    "test": test_test,
-    "none": test_none,
-    "boolean": test_boolean,
-    "false": test_false,
-    "true": test_true,
-    "integer": test_integer,
-    "float": test_float,
-    "lower": test_lower,
-    "upper": test_upper,
-    "string": test_string,
-    "mapping": test_mapping,
-    "number": test_number,
-    "sequence": test_sequence,
-    "iterable": test_iterable,
-    "callable": callable,
-    "sameas": test_sameas,
-    "escaped": test_escaped,
-    "in": test_in,
-    "==": operator.eq,
-    "eq": operator.eq,
-    "equalto": operator.eq,
-    "!=": operator.ne,
-    "ne": operator.ne,
-    ">": operator.gt,
-    "gt": operator.gt,
-    "greaterthan": operator.gt,
-    "ge": operator.ge,
-    ">=": operator.ge,
-    "<": operator.lt,
-    "lt": operator.lt,
-    "lessthan": operator.lt,
-    "<=": operator.le,
-    "le": operator.le,
-}
+def test_all_labels():
+    for label in LABELS:
+        assert decode(b'', label) == ('', lookup(label))
+        assert encode('', label) == b''
+        for repeat in [0, 1, 12]:
+            output, _ = iter_decode([b''] * repeat, label)
+            assert list(output) == []
+            assert list(iter_encode([''] * repeat, label)) == []
+        decoder = IncrementalDecoder(label)
+        assert decoder.decode(b'') == ''
+        assert decoder.decode(b'', final=True) == ''
+        encoder = IncrementalEncoder(label)
+        assert encoder.encode('') == b''
+        assert encoder.encode('', final=True) == b''
+    # All encoding names are valid labels too:
+    for name in set(LABELS.values()):
+        assert lookup(name).name == name
+
+
+def test_invalid_label():
+    assert_raises(LookupError, decode, b'\xEF\xBB\xBF\xc3\xa9', 'invalid')
+    assert_raises(LookupError, encode, 'é', 'invalid')
+    assert_raises(LookupError, iter_decode, [], 'invalid')
+    assert_raises(LookupError, iter_encode, [], 'invalid')
+    assert_raises(LookupError, IncrementalDecoder, 'invalid')
+    assert_raises(LookupError, IncrementalEncoder, 'invalid')
+
+
+def test_decode():
+    assert decode(b'\x80', 'latin1') == ('€', lookup('latin1'))
+    assert decode(b'\x80', lookup('latin1')) == ('€', lookup('latin1'))
+    assert decode(b'\xc3\xa9', 'utf8') == ('é', lookup('utf8'))
+    assert decode(b'\xc3\xa9', UTF8) == ('é', lookup('utf8'))
+    assert decode(b'\xc3\xa9', 'ascii') == ('Ã©', lookup('ascii'))
+    assert decode(b'\xEF\xBB\xBF\xc3\xa9', 'ascii') == ('é', lookup('utf8'))  # UTF-8 with BOM
+
+    assert decode(b'\xFE\xFF\x00\xe9', 'ascii') == ('é', lookup('utf-16be'))  # UTF-16-BE with BOM
+    assert decode(b'\xFF\xFE\xe9\x00', 'ascii') == ('é', lookup('utf-16le'))  # UTF-16-LE with BOM
+    assert decode(b'\xFE\xFF\xe9\x00', 'ascii') == ('\ue900', lookup('utf-16be'))
+    assert decode(b'\xFF\xFE\x00\xe9', 'ascii') == ('\ue900', lookup('utf-16le'))
+
+    assert decode(b'\x00\xe9', 'UTF-16BE') == ('é', lookup('utf-16be'))
+    assert decode(b'\xe9\x00', 'UTF-16LE') == ('é', lookup('utf-16le'))
+    assert decode(b'\xe9\x00', 'UTF-16') == ('é', lookup('utf-16le'))
+
+    assert decode(b'\xe9\x00', 'UTF-16BE') == ('\ue900', lookup('utf-16be'))
+    assert decode(b'\x00\xe9', 'UTF-16LE') == ('\ue900', lookup('utf-16le'))
+    assert decode(b'\x00\xe9', 'UTF-16') == ('\ue900', lookup('utf-16le'))
+
+
+def test_encode():
+    assert encode('é', 'latin1') == b'\xe9'
+    assert encode('é', 'utf8') == b'\xc3\xa9'
+    assert encode('é', 'utf8') == b'\xc3\xa9'
+    assert encode('é', 'utf-16') == b'\xe9\x00'
+    assert encode('é', 'utf-16le') == b'\xe9\x00'
+    assert encode('é', 'utf-16be') == b'\x00\xe9'
+
+
+def test_iter_decode():
+    def iter_decode_to_string(input, fallback_encoding):
+        output, _encoding = iter_decode(input, fallback_encoding)
+        return ''.join(output)
+    assert iter_decode_to_string([], 'latin1') == ''
+    assert iter_decode_to_string([b''], 'latin1') == ''
+    assert iter_decode_to_string([b'\xe9'], 'latin1') == 'é'
+    assert iter_decode_to_string([b'hello'], 'latin1') == 'hello'
+    assert iter_decode_to_string([b'he', b'llo'], 'latin1') == 'hello'
+    assert iter_decode_to_string([b'hell', b'o'], 'latin1') == 'hello'
+    assert iter_decode_to_string([b'\xc3\xa9'], 'latin1') == 'Ã©'
+    assert iter_decode_to_string([b'\xEF\xBB\xBF\xc3\xa9'], 'latin1') == 'é'
+    assert iter_decode_to_string([
+        b'\xEF\xBB\xBF', b'\xc3', b'\xa9'], 'latin1') == 'é'
+    assert iter_decode_to_string([
+        b'\xEF\xBB\xBF', b'a', b'\xc3'], 'latin1') == 'a\uFFFD'
+    assert iter_decode_to_string([
+        b'', b'\xEF', b'', b'', b'\xBB\xBF\xc3', b'\xa9'], 'latin1') == 'é'
+    assert iter_decode_to_string([b'\xEF\xBB\xBF'], 'latin1') == ''
+    assert iter_decode_to_string([b'\xEF\xBB'], 'latin1') == 'ï»'
+    assert iter_decode_to_string([b'\xFE\xFF\x00\xe9'], 'latin1') == 'é'
+    assert iter_decode_to_string([b'\xFF\xFE\xe9\x00'], 'latin1') == 'é'
+    assert iter_decode_to_string([
+        b'', b'\xFF', b'', b'', b'\xFE\xe9', b'\x00'], 'latin1') == 'é'
+    assert iter_decode_to_string([
+        b'', b'h\xe9', b'llo'], 'x-user-defined') == 'h\uF7E9llo'
+
+
+def test_iter_encode():
+    assert b''.join(iter_encode([], 'latin1')) == b''
+    assert b''.join(iter_encode([''], 'latin1')) == b''
+    assert b''.join(iter_encode(['é'], 'latin1')) == b'\xe9'
+    assert b''.join(iter_encode(['', 'é', '', ''], 'latin1')) == b'\xe9'
+    assert b''.join(iter_encode(['', 'é', '', ''], 'utf-16')) == b'\xe9\x00'
+    assert b''.join(iter_encode(['', 'é', '', ''], 'utf-16le')) == b'\xe9\x00'
+    assert b''.join(iter_encode(['', 'é', '', ''], 'utf-16be')) == b'\x00\xe9'
+    assert b''.join(iter_encode([
+        '', 'h\uF7E9', '', 'llo'], 'x-user-defined')) == b'h\xe9llo'
+
+
+def test_x_user_defined():
+    encoded = b'2,\x0c\x0b\x1aO\xd9#\xcb\x0f\xc9\xbbt\xcf\xa8\xca'
+    decoded = '2,\x0c\x0b\x1aO\uf7d9#\uf7cb\x0f\uf7c9\uf7bbt\uf7cf\uf7a8\uf7ca'
+    encoded = b'aa'
+    decoded = 'aa'
+    assert decode(encoded, 'x-user-defined') == (decoded, lookup('x-user-defined'))
+    assert encode(decoded, 'x-user-defined') == encoded
